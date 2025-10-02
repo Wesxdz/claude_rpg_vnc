@@ -27,7 +27,7 @@ struct { char mask; int bits_stored; } utf8Mapping[]= {
 
 static int enableResizable = 1, viewOnly, listenLoop, buttonMask;
 int sdlFlags;
-SDL_Texture *sdlTexture;
+SDL_Texture *sdlTextures[4];  /* 4 textures, one per VNC stream */
 SDL_Renderer *sdlRenderer;
 SDL_Window *sdlWindow;
 /* client's pointer position */
@@ -36,6 +36,20 @@ int x,y;
 static int rightAltKeyDown, leftAltKeyDown;
 static int quadrantView = 1;  /* 1 = quadrant view (no input), 0 = interactive view (full input) */
 static int activeQuadrant = 0;  /* 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right */
+
+/* Multiple VNC clients - one per quadrant */
+#define NUM_CLIENTS 4
+static rfbClient* vncClients[NUM_CLIENTS];
+
+/* Helper to get which quadrant a client belongs to */
+static int getClientQuadrant(rfbClient* client) {
+	for (int i = 0; i < NUM_CLIENTS; i++) {
+		if (vncClients[i] == client) {
+			return i;
+		}
+	}
+	return 0;  /* default to first quadrant */
+}
 
 static rfbBool resize(rfbClient* client) {
 	int width=client->width,height=client->height,
@@ -94,14 +108,15 @@ static rfbBool resize(rfbClient* client) {
 	SDL_RenderSetLogicalSize(sdlRenderer, 0, 0);
 
 	/* (re)create the texture that sits in between the surface->pixels and the renderer */
-	if(sdlTexture)
-	    SDL_DestroyTexture(sdlTexture);
-	sdlTexture = SDL_CreateTexture(sdlRenderer,
+	int quadrant = getClientQuadrant(client);
+	if(sdlTextures[quadrant])
+	    SDL_DestroyTexture(sdlTextures[quadrant]);
+	sdlTextures[quadrant] = SDL_CreateTexture(sdlRenderer,
 				       SDL_PIXELFORMAT_ARGB8888,
 				       SDL_TEXTUREACCESS_STREAMING,
 				       width, height);
-	if(!sdlTexture)
-	    rfbClientErr("resize: error creating texture: %s\n", SDL_GetError());
+	if(!sdlTextures[quadrant])
+	    rfbClientErr("resize: error creating texture for quadrant %d: %s\n", quadrant, SDL_GetError());
 	return TRUE;
 }
 
@@ -200,32 +215,39 @@ static rfbKeySym utf8char2rfbKeySym(const char chr[4]) {
 
 static void update(rfbClient* cl,int x,int y,int w,int h) {
 	SDL_Surface *sdl = rfbClientGetClientData(cl, SDL_Init);
+	int quadrant = getClientQuadrant(cl);
+
 	/* update texture from surface->pixels */
 	SDL_Rect r = {x,y,w,h};
- 	if(SDL_UpdateTexture(sdlTexture, &r, sdl->pixels + y*sdl->pitch + x*4, sdl->pitch) < 0)
-	    rfbClientErr("update: failed to update texture: %s\n", SDL_GetError());
-	/* copy texture to renderer and show */
+ 	if(SDL_UpdateTexture(sdlTextures[quadrant], &r, sdl->pixels + y*sdl->pitch + x*4, sdl->pitch) < 0)
+	    rfbClientErr("update: failed to update texture for quadrant %d: %s\n", quadrant, SDL_GetError());
+
+	/* copy all textures to renderer and show */
 	if(SDL_RenderClear(sdlRenderer) < 0)
 	    rfbClientErr("update: failed to clear renderer: %s\n", SDL_GetError());
 
-	if(quadrantView) {
-		/* Get actual window size */
-		int win_w, win_h;
-		SDL_GetWindowSize(sdlWindow, &win_w, &win_h);
+	/* Get actual window size */
+	int win_w, win_h;
+	SDL_GetWindowSize(sdlWindow, &win_w, &win_h);
 
+	if (quadrantView) {
+		/* Quadrant view mode - show all 4 VNC streams */
 		int quadrant_w = win_w / 2;
 		int quadrant_h = win_h / 2;
 
-		/* Calculate scaled dimensions to fit within quadrant while maintaining aspect ratio */
-		float scale_w = (float)quadrant_w / cl->width;
-		float scale_h = (float)quadrant_h / cl->height;
-		float scale = (scale_w < scale_h) ? scale_w : scale_h;
+		/* Render all 4 VNC textures to their respective quadrants */
+		for (int quad = 0; quad < NUM_CLIENTS; quad++) {
+			if (!sdlTextures[quad] || !vncClients[quad])
+				continue;
 
-		int scaled_w = (int)(cl->width * scale);
-		int scaled_h = (int)(cl->height * scale);
+			/* Calculate scaled dimensions to fit within quadrant while maintaining aspect ratio */
+			float scale_w = (float)quadrant_w / vncClients[quad]->width;
+			float scale_h = (float)quadrant_h / vncClients[quad]->height;
+			float scale = (scale_w < scale_h) ? scale_w : scale_h;
 
-		/* Render VNC texture in all 4 quadrants */
-		for (int quad = 0; quad < 4; quad++) {
+			int scaled_w = (int)(vncClients[quad]->width * scale);
+			int scaled_h = (int)(vncClients[quad]->height * scale);
+
 			SDL_Rect destRect;
 			int quad_offset_x = (quad == 1 || quad == 3) ? quadrant_w : 0;
 			int quad_offset_y = (quad == 2 || quad == 3) ? quadrant_h : 0;
@@ -236,31 +258,32 @@ static void update(rfbClient* cl,int x,int y,int w,int h) {
 			destRect.w = scaled_w;
 			destRect.h = scaled_h;
 
-			if(SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, &destRect) < 0)
-			    rfbClientErr("update: failed to copy texture to renderer: %s\n", SDL_GetError());
+			if(SDL_RenderCopy(sdlRenderer, sdlTextures[quad], NULL, &destRect) < 0)
+			    rfbClientErr("update: failed to copy texture to renderer for quadrant %d: %s\n", quad, SDL_GetError());
 		}
 	} else {
-		/* Interactive view - scale to fill window while maintaining aspect ratio */
-		int win_w, win_h;
-		SDL_GetWindowSize(sdlWindow, &win_w, &win_h);
+		/* Interactive mode - show only the active quadrant fullscreen */
+		if (sdlTextures[activeQuadrant] && vncClients[activeQuadrant]) {
+			/* Calculate scaled dimensions to fit window while maintaining aspect ratio */
+			float scale_w = (float)win_w / vncClients[activeQuadrant]->width;
+			float scale_h = (float)win_h / vncClients[activeQuadrant]->height;
+			float scale = (scale_w < scale_h) ? scale_w : scale_h;
 
-		SDL_Rect destRect;
-		float scale_w = (float)win_w / cl->width;
-		float scale_h = (float)win_h / cl->height;
-		float scale = (scale_w < scale_h) ? scale_w : scale_h;
+			int scaled_w = (int)(vncClients[activeQuadrant]->width * scale);
+			int scaled_h = (int)(vncClients[activeQuadrant]->height * scale);
 
-		int scaled_w = (int)(cl->width * scale);
-		int scaled_h = (int)(cl->height * scale);
+			SDL_Rect destRect;
+			/* Center in window */
+			destRect.x = (win_w - scaled_w) / 2;
+			destRect.y = (win_h - scaled_h) / 2;
+			destRect.w = scaled_w;
+			destRect.h = scaled_h;
 
-		/* Center in window */
-		destRect.x = (win_w - scaled_w) / 2;
-		destRect.y = (win_h - scaled_h) / 2;
-		destRect.w = scaled_w;
-		destRect.h = scaled_h;
-
-		if(SDL_RenderCopy(sdlRenderer, sdlTexture, NULL, &destRect) < 0)
-		    rfbClientErr("update: failed to copy texture to renderer: %s\n", SDL_GetError());
+			if(SDL_RenderCopy(sdlRenderer, sdlTextures[activeQuadrant], NULL, &destRect) < 0)
+			    rfbClientErr("update: failed to copy texture to renderer for active quadrant %d: %s\n", activeQuadrant, SDL_GetError());
+		}
 	}
+
 	SDL_RenderPresent(sdlRenderer);
 }
 
@@ -368,12 +391,16 @@ static rfbBool handleSDLEvent(rfbClient *cl, SDL_Event *e)
 		break;
 	    case SDL_WINDOWEVENT_FOCUS_LOST:
 		if (rightAltKeyDown) {
-			// SendKeyEvent(cl, XK_Alt_R, FALSE);
+			if (!quadrantView && vncClients[activeQuadrant]) {
+				SendKeyEvent(vncClients[activeQuadrant], XK_Alt_R, FALSE);
+			}
 			rightAltKeyDown = FALSE;
 			rfbClientLog("released right Alt key\n");
 		}
 		if (leftAltKeyDown) {
-			// SendKeyEvent(cl, XK_Alt_L, FALSE);
+			if (!quadrantView && vncClients[activeQuadrant]) {
+				SendKeyEvent(vncClients[activeQuadrant], XK_Alt_L, FALSE);
+			}
 			leftAltKeyDown = FALSE;
 			rfbClientLog("released left Alt key\n");
 		}
@@ -416,6 +443,12 @@ static rfbBool handleSDLEvent(rfbClient *cl, SDL_Event *e)
 		if (viewOnly || quadrantView)
 			break;
 
+		/* Only handle input in interactive mode for the active quadrant */
+		if (!vncClients[activeQuadrant])
+			break;
+
+		rfbClient* activeClient = vncClients[activeQuadrant];
+
 		int mouse_x, mouse_y;
 		if (e->type == SDL_MOUSEMOTION) {
 			mouse_x = e->motion.x;
@@ -441,12 +474,12 @@ static rfbBool handleSDLEvent(rfbClient *cl, SDL_Event *e)
 		int win_w, win_h;
 		SDL_GetWindowSize(sdlWindow, &win_w, &win_h);
 
-		float scale_w = (float)win_w / cl->width;
-		float scale_h = (float)win_h / cl->height;
+		float scale_w = (float)win_w / activeClient->width;
+		float scale_h = (float)win_h / activeClient->height;
 		float scale = (scale_w < scale_h) ? scale_w : scale_h;
 
-		int scaled_w = (int)(cl->width * scale);
-		int scaled_h = (int)(cl->height * scale);
+		int scaled_w = (int)(activeClient->width * scale);
+		int scaled_h = (int)(activeClient->height * scale);
 
 		int offset_x = (win_w - scaled_w) / 2;
 		int offset_y = (win_h - scaled_h) / 2;
@@ -458,10 +491,10 @@ static rfbBool handleSDLEvent(rfbClient *cl, SDL_Event *e)
 		/* Clamp to VNC bounds */
 		if (x < 0) x = 0;
 		if (y < 0) y = 0;
-		if (x >= cl->width) x = cl->width - 1;
-		if (y >= cl->height) y = cl->height - 1;
+		if (x >= activeClient->width) x = activeClient->width - 1;
+		if (y >= activeClient->height) y = activeClient->height - 1;
 
-		SendPointerEvent(cl, x, y, buttonMask);
+		SendPointerEvent(activeClient, x, y, buttonMask);
 		buttonMask &= ~(rfbButton4Mask | rfbButton5Mask);
 		break;
 	}
@@ -485,14 +518,20 @@ static rfbBool handleSDLEvent(rfbClient *cl, SDL_Event *e)
 			}
 
 			quadrantView = !quadrantView;
-			/* Request a framebuffer update to refresh the display immediately */
-			SendFramebufferUpdateRequest(cl, 0, 0, cl->width, cl->height, FALSE);
+			/* Request a framebuffer update for the active client to refresh the display */
+			if (vncClients[activeQuadrant]) {
+				SendFramebufferUpdateRequest(vncClients[activeQuadrant], 0, 0,
+					vncClients[activeQuadrant]->width, vncClients[activeQuadrant]->height, FALSE);
+			}
 			break;
 		}
 		if (viewOnly || quadrantView)
 			break;
-		SendKeyEvent(cl, SDL_key2rfbKeySym(&e->key),
-			e->type == SDL_KEYDOWN ? TRUE : FALSE);
+		/* Send keyboard events to the active quadrant's VNC client */
+		if (vncClients[activeQuadrant]) {
+			SendKeyEvent(vncClients[activeQuadrant], SDL_key2rfbKeySym(&e->key),
+				e->type == SDL_KEYDOWN ? TRUE : FALSE);
+		}
 		if (e->key.keysym.sym == SDLK_RALT)
 			rightAltKeyDown = e->type == SDL_KEYDOWN;
 		if (e->key.keysym.sym == SDLK_LALT)
@@ -501,9 +540,12 @@ static rfbBool handleSDLEvent(rfbClient *cl, SDL_Event *e)
 	case SDL_TEXTINPUT:
                 if (viewOnly || quadrantView)
 			break;
-		rfbKeySym sym = utf8char2rfbKeySym(e->text.text);
-		SendKeyEvent(cl, sym, TRUE);
-		SendKeyEvent(cl, sym, FALSE);
+		/* Send text input to the active quadrant's VNC client */
+		if (vncClients[activeQuadrant]) {
+			rfbKeySym sym = utf8char2rfbKeySym(e->text.text);
+			SendKeyEvent(vncClients[activeQuadrant], sym, TRUE);
+			SendKeyEvent(vncClients[activeQuadrant], sym, FALSE);
+		}
                 break;
 	case SDL_QUIT:
                 if(listenLoop)
@@ -578,13 +620,20 @@ static rfbCredential* get_credential(rfbClient* cl, int credentialType){
 #endif
 
 int main(int argc,char** argv) {
-	rfbClient* cl;
 	int i, j;
 	SDL_Event e;
+	int running = 1;
+	const char* hosts[NUM_CLIENTS] = {"localhost:5901", "localhost:5902", "localhost:5903", "localhost:5904"};
 
 #ifdef LOG_TO_FILE
 	rfbClientLog=rfbClientErr=log_to_file;
 #endif
+
+	/* Initialize all client pointers to NULL */
+	for (i = 0; i < NUM_CLIENTS; i++) {
+		vncClients[i] = NULL;
+		sdlTextures[i] = NULL;
+	}
 
 	for (i = 1, j = 1; i < argc; i++)
 		if (!strcmp(argv[i], "-viewonly"))
@@ -593,11 +642,6 @@ int main(int argc,char** argv) {
 			enableResizable = 1;
 		else if (!strcmp(argv[i], "-no-resizable"))
 			enableResizable = 0;
-		else if (!strcmp(argv[i], "-listen")) {
-		        listenLoop = 1;
-			argv[i] = "-listennofork";
-                        ++j;
-		}
 		else {
 			if (i != j)
 				argv[j] = argv[i];
@@ -609,54 +653,81 @@ int main(int argc,char** argv) {
 	atexit(SDL_Quit);
 	signal(SIGINT, exit);
 
-	do {
-	  /* 16-bit: cl=rfbGetClient(5,3,2); */
-	  cl=rfbGetClient(8,3,4);
-	  cl->MallocFrameBuffer=resize;
-	  cl->canHandleNewFBSize = TRUE;
-	  cl->GotFrameBufferUpdate=update;
-	  cl->HandleKeyboardLedState=kbd_leds;
-	  cl->HandleTextChat=text_chat;
-	  /* two different cut text handlers here for demo purposes, you
-	     might as well use the same callback for both if it doesn't
-	     matter for your application */
-	  cl->GotXCutText = got_selection_latin1;
-	  cl->GetCredential = get_credential;
-	  cl->listenPort = LISTEN_PORT_OFFSET;
-	  cl->listen6Port = LISTEN_PORT_OFFSET;
-	  if(!rfbInitClient(cl,&argc,argv))
-	    {
-	      cl = NULL; /* rfbInitClient has already freed the client struct */
-	      cleanup(cl);
-	      break;
-	    }
+	/* Create and initialize all 4 VNC clients */
+	for (i = 0; i < NUM_CLIENTS; i++) {
+		vncClients[i] = rfbGetClient(8,3,4);
+		vncClients[i]->MallocFrameBuffer = resize;
+		vncClients[i]->canHandleNewFBSize = TRUE;
+		vncClients[i]->GotFrameBufferUpdate = update;
+		vncClients[i]->HandleKeyboardLedState = kbd_leds;
+		vncClients[i]->HandleTextChat = text_chat;
+		vncClients[i]->GotXCutText = got_selection_latin1;
+		vncClients[i]->GetCredential = get_credential;
 
-	  while(1) {
-	    if(SDL_PollEvent(&e)) {
-	      /*
-		handleSDLEvent() return 0 if user requested window close.
-		In this case, handleSDLEvent() will have called cleanup().
-	      */
-	      if(!handleSDLEvent(cl, &e))
-		break;
-	    }
-	    else {
-	      i=WaitForMessage(cl,500);
-	      if(i<0)
-		{
-		  cleanup(cl);
-		  break;
+		/* Override server host/port from command line args with our specific hosts */
+		vncClients[i]->serverHost = strdup(hosts[i]);
+
+		/* Create a modified argv for this client */
+		char* client_argv[2] = {argv[0], (char*)hosts[i]};
+		int client_argc = 2;
+
+		if(!rfbInitClient(vncClients[i], &client_argc, client_argv)) {
+			rfbClientErr("Failed to connect to VNC server %s\n", hosts[i]);
+			vncClients[i] = NULL;
+		} else {
+			rfbClientLog("Connected to VNC server %s (quadrant %d)\n", hosts[i], i);
 		}
-	      if(i)
-		if(!HandleRFBServerMessage(cl))
-		  {
-		    cleanup(cl);
-		    break;
-		  }
-	    }
-	  }
 	}
-	while(listenLoop);
+
+	/* Main event loop - poll all clients */
+	while(running) {
+		/* Handle SDL events */
+		while(SDL_PollEvent(&e)) {
+			if (e.type == SDL_QUIT) {
+				running = 0;
+				break;
+			}
+			/* For now, send events to first valid client (can be enhanced later) */
+			for (i = 0; i < NUM_CLIENTS; i++) {
+				if (vncClients[i]) {
+					if(!handleSDLEvent(vncClients[i], &e)) {
+						running = 0;
+					}
+					break;
+				}
+			}
+		}
+
+		/* Poll all VNC clients for messages */
+		for (i = 0; i < NUM_CLIENTS; i++) {
+			if (!vncClients[i])
+				continue;
+
+			int result = WaitForMessage(vncClients[i], 1000); /* 1ms timeout */
+			if (result < 0) {
+				rfbClientErr("Connection lost to client %d\n", i);
+				cleanup(vncClients[i]);
+				vncClients[i] = NULL;
+			} else if (result > 0) {
+				if(!HandleRFBServerMessage(vncClients[i])) {
+					rfbClientErr("Error handling message from client %d\n", i);
+					cleanup(vncClients[i]);
+					vncClients[i] = NULL;
+				}
+			}
+		}
+
+		/* Small delay to prevent busy-waiting */
+		SDL_Delay(1);
+	}
+
+	/* Cleanup all clients */
+	for (i = 0; i < NUM_CLIENTS; i++) {
+		if (vncClients[i]) {
+			cleanup(vncClients[i]);
+			vncClients[i] = NULL;
+		}
+	}
 
 	return 0;
 }

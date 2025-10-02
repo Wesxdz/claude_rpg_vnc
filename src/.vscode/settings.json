@@ -68,6 +68,13 @@
         "list": "cpp",
         "unordered_set": "cpp",
         "__hash_table": "cpp",
-        "map": "cpp"
+        "map": "cpp",
+        "cstdarg": "cpp",
+        "codecvt": "cpp",
+        "ratio": "cpp",
+        "fstream": "cpp",
+        "iomanip": "cpp",
+        "numeric": "cpp",
+        "cinttypes": "cpp"
     }
 }

@@ -34,7 +34,7 @@ find_package(SDL2 REQUIRED)
 add_executable(${PROJECT_NAME} src/main.cpp ${GLAD_GL})
 
 target_compile_options(${PROJECT_NAME} PUBLIC -w)
-target_link_libraries(${PROJECT_NAME} flecs glfw nanovg freeglut evdev X11 Xi Xtst SDL2::SDL2)
+target_link_libraries(${PROJECT_NAME} flecs glfw nanovg freeglut evdev X11 Xi Xtst SDL2)
 
 if(LibVNCServer_FOUND)
     target_link_libraries(${PROJECT_NAME} LibVNCServer::vncclient)
@@ -42,11 +42,3 @@ if(LibVNCServer_FOUND)
 endif()
 
 set_property(TARGET ${PROJECT_NAME} PROPERTY CXX_STANDARD 17)
-
-# Simple SDL VNC viewer
-add_executable(sdl_vnc_viewer src/sdl_vnc_viewer.c)
-target_link_libraries(sdl_vnc_viewer SDL2::SDL2)
-if(LibVNCServer_FOUND)
-    target_link_libraries(sdl_vnc_viewer LibVNCServer::vncclient)
-endif()
-set_property(TARGET sdl_vnc_viewer PROPERTY CXX_STANDARD 17)

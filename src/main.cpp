@@ -29,14 +29,20 @@ namespace fs = std::filesystem;
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
 
+// Clean up X11 macro pollution before C++ libs that use `Bool`, `Status`, etc.
+#ifdef Bool
+#  undef Bool
+#endif
+#ifdef Status
+#  undef Status
+#endif
+#ifdef None
+#  undef None      // (Optional, X11 defines None; can bite with std::optional, enums, etc.)
+#endif
+
 #include <nanovg.h>
 #define NANOVG_GL3_IMPLEMENTATION
 #include <nanovg_gl.h>
-
-// Undef X11 macros that conflict with flecs (must be before flecs.h)
-#ifdef Bool
-#undef Bool
-#endif
 
 #include <flecs.h>
 
@@ -52,103 +58,188 @@ namespace fs = std::filesystem;
 // LibVNC
 #include <rfb/rfbclient.h>
 
-// SDL (include after X11)
+// SDL for texture creation from VNC framebuffer
 #include <SDL2/SDL.h>
 
-// VNC Component to store client and framebuffer using SDL
+// VNC Client Components
+#define NUM_VNC_CLIENTS 4
+
 struct VNCClient {
     rfbClient* client = nullptr;
-    SDL_Window* sdlWindow = nullptr;
-    SDL_Renderer* sdlRenderer = nullptr;
-    SDL_Texture* sdlTexture = nullptr;
     SDL_Surface* surface = nullptr;
+    bool connected = false;
+    std::string host;
+    int port;
+    int width = 0;
+    int height = 0;
+    int quadrant = 0;  // Which quadrant this client belongs to (0-3)
+};
+
+struct VNCUpdateRect {
+    int x, y, w, h;
+};
+
+struct VNCTexture {
+    GLuint texture = 0;
+    int nvgHandle = -1;
     int width = 0;
     int height = 0;
     bool needsUpdate = false;
+    std::vector<VNCUpdateRect> dirtyRects;  // Track which regions need updating
 };
 
-// VNC resize callback - creates SDL surface for framebuffer (like SDL viewer)
+// Global VNC view state
+struct VNCViewState {
+    bool quadrantView = true;  // true = quadrant view (no input), false = interactive mode
+    int activeQuadrant = 0;    // 0=top-left, 1=top-right, 2=bottom-left, 3=bottom-right
+};
+
+void set_window_type_desktop(Display* dpy, Window win) {
+    Atom wm_window_type = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE", False);
+    Atom wm_window_type_desktop = XInternAtom(dpy, "_NET_WM_WINDOW_TYPE_UTILITY", False);
+
+    XChangeProperty(
+        dpy,
+        win,
+        wm_window_type,
+        XA_ATOM,
+        32,
+        PropModeReplace,
+        (unsigned char*)&wm_window_type_desktop,
+        1
+    );
+    XFlush(dpy);
+}
+
+void set_window_state_above(Display* dpy, Window win) {
+    Atom wm_state = XInternAtom(dpy, "_NET_WM_STATE", False);
+    Atom wm_above = XInternAtom(dpy, "_NET_WM_STATE_ABOVE", False);
+
+    XChangeProperty(
+        dpy,
+        win,
+        wm_state,
+        XA_ATOM,
+        32,
+        PropModeAppend,
+        (unsigned char*)&wm_above,
+        1
+    );
+    XFlush(dpy);
+}
+
+// Global reference to ECS world for VNC callbacks
+static flecs::world* g_vnc_world = nullptr;
+
+// Tag for VNC client data storage
+static const char* VNC_SURFACE_TAG = "vnc_surface";
+
+// VNC callback: Resize framebuffer
 static rfbBool vnc_resize_callback(rfbClient* client) {
-    VNCClient* vncComp = (VNCClient*)rfbClientGetClientData(client, nullptr);
+    std::cout << "[VNC] Resize callback - width: " << client->width
+              << ", height: " << client->height
+              << ", depth: " << client->format.bitsPerPixel << std::endl;
 
     int width = client->width;
     int height = client->height;
     int depth = client->format.bitsPerPixel;
 
-    std::cout << "VNC resize callback: " << width << "x" << height << " depth: " << depth << std::endl;
-
-    // Free old surface if it exists
-    if (vncComp->surface) {
-        SDL_FreeSurface(vncComp->surface);
+    // Free old surface
+    SDL_Surface* oldSurface = (SDL_Surface*)rfbClientGetClientData(client, (void*)VNC_SURFACE_TAG);
+    if (oldSurface) {
+        std::cout << "[VNC] Freeing old surface" << std::endl;
+        SDL_FreeSurface(oldSurface);
     }
 
-    // Create SDL surface for the framebuffer
-    vncComp->surface = SDL_CreateRGBSurface(0, width, height, depth, 0, 0, 0, 0);
-    if (!vncComp->surface) {
-        std::cerr << "Failed to create SDL surface: " << SDL_GetError() << std::endl;
+    // Create new surface for framebuffer
+    SDL_Surface* surface = SDL_CreateRGBSurface(0, width, height, depth, 0, 0, 0, 0);
+    if (!surface) {
+        std::cerr << "[VNC ERROR] Failed to create surface: " << SDL_GetError() << std::endl;
         return FALSE;
     }
 
-    vncComp->width = width;
-    vncComp->height = height;
+    std::cout << "[VNC] Created new surface: " << width << "x" << height
+              << " @ " << depth << "bpp" << std::endl;
 
-    // Point VNC client's framebuffer to SDL surface pixels
-    client->width = vncComp->surface->pitch / (depth / 8);
-    client->frameBuffer = (uint8_t*)vncComp->surface->pixels;
+    // Store surface in client data
+    rfbClientSetClientData(client, (void*)VNC_SURFACE_TAG, surface);
 
-    // Set pixel format based on SDL surface
+    // Configure framebuffer
+    // Note: Don't modify client->width based on pitch - keep actual width
+    // The pitch may be larger due to alignment, but width should be display width
+    client->frameBuffer = (uint8_t*)surface->pixels;
+
+    // Set pixel format
     client->format.bitsPerPixel = depth;
-    client->format.redShift = vncComp->surface->format->Rshift;
-    client->format.greenShift = vncComp->surface->format->Gshift;
-    client->format.blueShift = vncComp->surface->format->Bshift;
-    client->format.redMax = vncComp->surface->format->Rmask >> client->format.redShift;
-    client->format.greenMax = vncComp->surface->format->Gmask >> client->format.greenShift;
-    client->format.blueMax = vncComp->surface->format->Bmask >> client->format.blueShift;
+    client->format.redShift = surface->format->Rshift;
+    client->format.greenShift = surface->format->Gshift;
+    client->format.blueShift = surface->format->Bshift;
+    client->format.redMax = surface->format->Rmask >> client->format.redShift;
+    client->format.greenMax = surface->format->Gmask >> client->format.greenShift;
+    client->format.blueMax = surface->format->Bmask >> client->format.blueShift;
 
-    std::cout << "SDL surface created: pitch=" << vncComp->surface->pitch << std::endl;
-    std::cout << "  Format: bpp=" << (int)client->format.bitsPerPixel
-              << " R=" << (int)client->format.redShift << "/" << (int)client->format.redMax
-              << " G=" << (int)client->format.greenShift << "/" << (int)client->format.greenMax
-              << " B=" << (int)client->format.blueShift << "/" << (int)client->format.blueMax << std::endl;
-    std::cout << "  SDL Rmask=0x" << std::hex << vncComp->surface->format->Rmask
-              << " Gmask=0x" << vncComp->surface->format->Gmask
-              << " Bmask=0x" << vncComp->surface->format->Bmask
-              << " Amask=0x" << vncComp->surface->format->Amask << std::dec << std::endl;
+    std::cout << "[VNC] Pixel format - R shift: " << client->format.redShift
+              << ", G shift: " << client->format.greenShift
+              << ", B shift: " << client->format.blueShift << std::endl;
 
     SetFormatAndEncodings(client);
-
-    // (Re)create SDL texture if we have a renderer
-    if (vncComp->sdlRenderer) {
-        if (vncComp->sdlTexture) {
-            SDL_DestroyTexture(vncComp->sdlTexture);
-        }
-        vncComp->sdlTexture = SDL_CreateTexture(vncComp->sdlRenderer,
-                                                SDL_PIXELFORMAT_ARGB8888,
-                                                SDL_TEXTUREACCESS_STREAMING,
-                                                width, height);
-        if (!vncComp->sdlTexture) {
-            std::cerr << "Failed to create SDL texture: " << SDL_GetError() << std::endl;
-        } else {
-            std::cout << "Created SDL texture for " << width << "x" << height << std::endl;
-        }
-    }
+    std::cout << "[VNC] Resize complete" << std::endl;
 
     return TRUE;
 }
 
-static void vnc_update_callback(rfbClient* client, int x, int y, int w, int h) {
-    VNCClient* vncComp = (VNCClient*)rfbClientGetClientData(client, nullptr);
-    vncComp->needsUpdate = true;
+// Helper to get which quadrant a client belongs to
+static int getClientQuadrant(rfbClient* client) {
+    if (g_vnc_world) {
+        auto query = g_vnc_world->query<VNCClient>();
+        int foundQuadrant = 0;
+        query.each([&](flecs::entity e, VNCClient& vnc) {
+            if (vnc.client == client) {
+                foundQuadrant = vnc.quadrant;
+            }
+        });
+        return foundQuadrant;
+    }
+    return 0;
+}
 
-    static int updateCount = 0;
-    if (updateCount++ < 5) {
-        std::cout << "VNC update callback: region (" << x << "," << y << "," << w << "," << h << ")" << std::endl;
+// VNC callback: Framebuffer update
+static void vnc_update_callback(rfbClient* client, int x, int y, int w, int h) {
+    int quadrant = getClientQuadrant(client);
+    std::cout << "[VNC UPDATE] Quadrant " << quadrant << " framebuffer updated - rect: (" << x << "," << y
+              << ") size: " << w << "x" << h << std::endl;
+
+    // Mark texture region for update in ECS - find the texture for this specific client
+    if (g_vnc_world) {
+        auto query = g_vnc_world->query<VNCClient, VNCTexture>();
+        int updateCount = 0;
+        query.each([&](flecs::entity e, VNCClient& vnc, VNCTexture& tex) {
+            if (vnc.client == client) {
+                // Add the dirty rectangle to the update queue
+                tex.dirtyRects.push_back({x, y, w, h});
+                tex.needsUpdate = true;
+                updateCount++;
+                std::cout << "[VNC UPDATE] Added dirty rect to quadrant " << quadrant
+                          << " - total rects: " << tex.dirtyRects.size() << std::endl;
+            }
+        });
+        std::cout << "[VNC UPDATE] Marked " << updateCount << " textures for update" << std::endl;
+    } else {
+        std::cerr << "[VNC ERROR] g_vnc_world is null in update callback!" << std::endl;
     }
 }
 
-rfbClient* connectToTurboVNC(const char* host, int port, VNCClient* vncComp) {
+rfbClient* connectToTurboVNC(const char* host, int port) {
+    std::cout << "[VNC] Connecting to " << host << ":" << port << std::endl;
+
     rfbClient* client = rfbGetClient(8, 3, 4);
 
+    // Set callbacks
+    client->MallocFrameBuffer = vnc_resize_callback;
+    client->canHandleNewFBSize = TRUE;
+    client->GotFrameBufferUpdate = vnc_update_callback;
+
+    // Enable TurboVNC/TurboJPEG compression
     client->appData.encodingsString = "tight copyrect";
     client->appData.compressLevel = 1;
     client->appData.qualityLevel = 8;
@@ -157,16 +248,15 @@ rfbClient* connectToTurboVNC(const char* host, int port, VNCClient* vncComp) {
     client->serverHost = strdup(host);
     client->serverPort = port;
 
-    // Set callbacks
-    client->MallocFrameBuffer = vnc_resize_callback;
-    client->GotFrameBufferUpdate = vnc_update_callback;
-
-    // Store VNCClient reference
-    rfbClientSetClientData(client, nullptr, vncComp);
-
+    std::cout << "[VNC] Initializing client..." << std::endl;
     if (!rfbInitClient(client, NULL, NULL)) {
+        std::cerr << "[VNC ERROR] Failed to initialize client" << std::endl;
         return NULL;
     }
+
+    std::cout << "[VNC] Connected successfully!" << std::endl;
+    std::cout << "[VNC] Desktop: " << client->desktopName << std::endl;
+    std::cout << "[VNC] Size: " << client->width << "x" << client->height << std::endl;
 
     return client;
 }
@@ -515,6 +605,13 @@ struct Graphics {
     NVGcontext* vg;
 };
 
+struct RenderTexture {
+    GLuint fbo;
+    GLuint texture;
+    int width;
+    int height;
+};
+
 enum class RenderType {
     Rectangle,
     Text,
@@ -567,8 +664,164 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height) {
 // Global world reference for mouse callback
 flecs::world* g_world = nullptr;
 
+// GLFW to X11 keysym mapping for VNC input
+rfbKeySym glfw_key_to_rfb_keysym(int key) {
+    switch (key) {
+        case GLFW_KEY_BACKSPACE: return XK_BackSpace;
+        case GLFW_KEY_TAB: return XK_Tab;
+        case GLFW_KEY_ENTER: return XK_Return;
+        case GLFW_KEY_PAUSE: return XK_Pause;
+        case GLFW_KEY_ESCAPE: return XK_Escape;
+        case GLFW_KEY_DELETE: return XK_Delete;
+        case GLFW_KEY_KP_0: return XK_KP_0;
+        case GLFW_KEY_KP_1: return XK_KP_1;
+        case GLFW_KEY_KP_2: return XK_KP_2;
+        case GLFW_KEY_KP_3: return XK_KP_3;
+        case GLFW_KEY_KP_4: return XK_KP_4;
+        case GLFW_KEY_KP_5: return XK_KP_5;
+        case GLFW_KEY_KP_6: return XK_KP_6;
+        case GLFW_KEY_KP_7: return XK_KP_7;
+        case GLFW_KEY_KP_8: return XK_KP_8;
+        case GLFW_KEY_KP_9: return XK_KP_9;
+        case GLFW_KEY_KP_DECIMAL: return XK_KP_Decimal;
+        case GLFW_KEY_KP_DIVIDE: return XK_KP_Divide;
+        case GLFW_KEY_KP_MULTIPLY: return XK_KP_Multiply;
+        case GLFW_KEY_KP_SUBTRACT: return XK_KP_Subtract;
+        case GLFW_KEY_KP_ADD: return XK_KP_Add;
+        case GLFW_KEY_KP_ENTER: return XK_KP_Enter;
+        case GLFW_KEY_KP_EQUAL: return XK_KP_Equal;
+        case GLFW_KEY_UP: return XK_Up;
+        case GLFW_KEY_DOWN: return XK_Down;
+        case GLFW_KEY_RIGHT: return XK_Right;
+        case GLFW_KEY_LEFT: return XK_Left;
+        case GLFW_KEY_INSERT: return XK_Insert;
+        case GLFW_KEY_HOME: return XK_Home;
+        case GLFW_KEY_END: return XK_End;
+        case GLFW_KEY_PAGE_UP: return XK_Page_Up;
+        case GLFW_KEY_PAGE_DOWN: return XK_Page_Down;
+        case GLFW_KEY_F1: return XK_F1;
+        case GLFW_KEY_F2: return XK_F2;
+        case GLFW_KEY_F3: return XK_F3;
+        case GLFW_KEY_F4: return XK_F4;
+        case GLFW_KEY_F5: return XK_F5;
+        case GLFW_KEY_F6: return XK_F6;
+        case GLFW_KEY_F7: return XK_F7;
+        case GLFW_KEY_F8: return XK_F8;
+        case GLFW_KEY_F9: return XK_F9;
+        case GLFW_KEY_F10: return XK_F10;
+        case GLFW_KEY_F11: return XK_F11;
+        case GLFW_KEY_F12: return XK_F12;
+        case GLFW_KEY_F13: return XK_F13;
+        case GLFW_KEY_F14: return XK_F14;
+        case GLFW_KEY_F15: return XK_F15;
+        case GLFW_KEY_NUM_LOCK: return XK_Num_Lock;
+        case GLFW_KEY_CAPS_LOCK: return XK_Caps_Lock;
+        case GLFW_KEY_SCROLL_LOCK: return XK_Scroll_Lock;
+        case GLFW_KEY_RIGHT_SHIFT: return XK_Shift_R;
+        case GLFW_KEY_LEFT_SHIFT: return XK_Shift_L;
+        case GLFW_KEY_RIGHT_CONTROL: return XK_Control_R;
+        case GLFW_KEY_LEFT_CONTROL: return XK_Control_L;
+        case GLFW_KEY_RIGHT_ALT: return XK_Alt_R;
+        case GLFW_KEY_LEFT_ALT: return XK_Alt_L;
+        case GLFW_KEY_RIGHT_SUPER: return XK_Super_R;
+        case GLFW_KEY_LEFT_SUPER: return XK_Super_L;
+        case GLFW_KEY_MENU: return XK_Menu;
+        case GLFW_KEY_PRINT_SCREEN: return XK_Print;
+        default:
+            // For regular character keys
+            if (key >= GLFW_KEY_SPACE && key <= GLFW_KEY_GRAVE_ACCENT) {
+                return key;
+            }
+            return 0;
+    }
+}
+
+// Keyboard callback for VNC input passthrough
+void key_callback(GLFWwindow* window, int key, int scancode, int action, int mods) {
+    if (!g_world) return;
+
+    // Check if we're in interactive mode
+    const VNCViewState* viewState = g_world->try_get<VNCViewState>();
+    if (!viewState || viewState->quadrantView) return;  // No input in quadrant view mode
+
+    // Find the active VNC client
+    auto query = g_world->query<VNCClient>();
+    query.each([&](flecs::entity e, VNCClient& vnc) {
+        if (vnc.quadrant == viewState->activeQuadrant && vnc.connected && vnc.client) {
+            rfbKeySym keysym = glfw_key_to_rfb_keysym(key);
+            if (keysym != 0 && key != GLFW_KEY_F1) {  // Don't send F1 to VNC (used for mode toggle)
+                SendKeyEvent(vnc.client, keysym, action != GLFW_RELEASE);
+            }
+        }
+    });
+}
+
+// Character callback for text input to VNC
+void char_callback(GLFWwindow* window, unsigned int codepoint) {
+    if (!g_world) return;
+
+    // Check if we're in interactive mode
+    const VNCViewState* viewState = g_world->try_get<VNCViewState>();
+    if (!viewState || viewState->quadrantView) return;
+
+    // Find the active VNC client
+    auto query = g_world->query<VNCClient>();
+    query.each([&](flecs::entity e, VNCClient& vnc) {
+        if (vnc.quadrant == viewState->activeQuadrant && vnc.connected && vnc.client) {
+            // Send as keysym (Unicode codepoint)
+            SendKeyEvent(vnc.client, codepoint, TRUE);
+            SendKeyEvent(vnc.client, codepoint, FALSE);
+        }
+    });
+}
+
 void mouse_button_callback(GLFWwindow* window, int button, int action, int mods) {
     if (action == GLFW_PRESS && g_world) {
+        // Check if we're in interactive mode
+        const VNCViewState* viewState = g_world->try_get<VNCViewState>();
+        if (viewState && !viewState->quadrantView) {
+            // Interactive mode - forward mouse input to active VNC client
+            double mouseX, mouseY;
+            glfwGetCursorPos(window, &mouseX, &mouseY);
+
+            // Find the active VNC client
+            auto query = g_world->query<VNCClient, Position, ImageRenderable>();
+            query.each([&](flecs::entity e, VNCClient& vnc, Position& pos, ImageRenderable& img) {
+                if (vnc.quadrant == viewState->activeQuadrant && vnc.connected && vnc.client) {
+                    // Convert mouse coordinates from window space to VNC space
+                    int win_w, win_h;
+                    glfwGetWindowSize(window, &win_w, &win_h);
+
+                    float scale_w = img.width / vnc.width;
+                    float scale_h = img.height / vnc.height;
+
+                    int offset_x = (int)pos.x;
+                    int offset_y = (int)pos.y;
+
+                    // Convert to VNC coordinates
+                    int vnc_x = (int)((mouseX - offset_x) / scale_w);
+                    int vnc_y = (int)((mouseY - offset_y) / scale_h);
+
+                    // Clamp to VNC bounds
+                    if (vnc_x < 0) vnc_x = 0;
+                    if (vnc_y < 0) vnc_y = 0;
+                    if (vnc_x >= vnc.width) vnc_x = vnc.width - 1;
+                    if (vnc_y >= vnc.height) vnc_y = vnc.height - 1;
+
+                    // Map GLFW button to RFB button mask
+                    int buttonMask = 0;
+                    if (button == GLFW_MOUSE_BUTTON_LEFT) buttonMask = rfbButton1Mask;
+                    else if (button == GLFW_MOUSE_BUTTON_MIDDLE) buttonMask = rfbButton2Mask;
+                    else if (button == GLFW_MOUSE_BUTTON_RIGHT) buttonMask = rfbButton3Mask;
+
+                    SendPointerEvent(vnc.client, vnc_x, vnc_y, buttonMask);
+                    std::cout << "[VNC INPUT] Mouse click at VNC coords (" << vnc_x << "," << vnc_y << ")" << std::endl;
+                }
+            });
+            return;  // Don't process game clicks in interactive mode
+        }
+
+        // Quadrant view mode - process game clicks
         // Get mouse position
         double mouseX, mouseY;
         glfwGetCursorPos(window, &mouseX, &mouseY);
@@ -678,7 +931,7 @@ void mouse_button_callback(GLFWwindow* window, int button, int action, int mods)
 // Global debug render entity
 flecs::entity g_debugRenderEntity;
 
-void processInput(GLFWwindow *window) {
+void processInput(GLFWwindow *window, flecs::world& world) {
     if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
         glfwSetWindowShouldClose(window, true);
 
@@ -694,19 +947,44 @@ void processInput(GLFWwindow *window) {
     }
 
     dotKeyPressed = dotKeyDown;
+
+    // F1 key to toggle between quadrant and interactive mode
+    static bool f1KeyPressed = false;
+    bool f1KeyDown = glfwGetKey(window, GLFW_KEY_F1) == GLFW_PRESS;
+
+    if (f1KeyDown && !f1KeyPressed) {
+        auto viewState = world.try_get<VNCViewState>();
+        if (viewState) {
+            VNCViewState newState = *viewState;
+
+            if (newState.quadrantView) {
+                // Switching from quadrant to interactive - determine which quadrant mouse is over
+                double mouse_x, mouse_y;
+                glfwGetCursorPos(window, &mouse_x, &mouse_y);
+                int win_w, win_h;
+                glfwGetWindowSize(window, &win_w, &win_h);
+
+                int quad_x = (mouse_x < win_w / 2) ? 0 : 1;
+                int quad_y = (mouse_y < win_h / 2) ? 0 : 1;
+                newState.activeQuadrant = quad_y * 2 + quad_x;
+
+                std::cout << "Entering interactive mode for quadrant " << newState.activeQuadrant << std::endl;
+            } else {
+                std::cout << "Returning to quadrant view" << std::endl;
+            }
+
+            newState.quadrantView = !newState.quadrantView;
+            world.set<VNCViewState>(newState);
+        }
+    }
+
+    f1KeyPressed = f1KeyDown;
 }
 
 int main(int, char *[]) {
-
-    // Initialize SDL (only need video subsystem for surface creation)
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        std::cerr << "Failed to initialize SDL: " << SDL_GetError() << std::endl;
-        return -1;
-    }
-
+    
     if (!glfwInit()) {
         std::cerr << "Failed to initialize GLFW" << std::endl;
-        SDL_Quit();
         return -1;
     }
     glfwSetErrorCallback(error_callback);
@@ -735,6 +1013,8 @@ int main(int, char *[]) {
         glfwTerminate();
         return -1;
     }
+    Window x11_window = glfwGetX11Window(window);
+    // set_window_type_desktop(display, x11_window);
     system("wmctrl -r \"GraphSail\" -b add,above");
     
     glfwMakeContextCurrent(window);
@@ -751,6 +1031,8 @@ int main(int, char *[]) {
     // This doesn't get called if you need a transparent overlay
     // glfwSetCursorPosCallback(window, cursor_position_callback);
     glfwSetMouseButtonCallback(window, mouse_button_callback);
+    glfwSetKeyCallback(window, key_callback);
+    glfwSetCharCallback(window, char_callback);
 
     // Hide the system cursor since we're drawing our own
     glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN);
@@ -767,9 +1049,19 @@ int main(int, char *[]) {
         return -1;
     }
 
+    // Initialize SDL for VNC texture creation
+    std::cout << "[SDL] Initializing SDL..." << std::endl;
+    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
+        std::cerr << "[SDL ERROR] Failed to initialize: " << SDL_GetError() << std::endl;
+        glfwTerminate();
+        return -1;
+    }
+    std::cout << "[SDL] SDL initialized successfully" << std::endl;
+
     // Create flecs world
     flecs::world world;
     g_world = &world; // Set global reference for mouse callback
+    g_vnc_world = &world; // Set global reference for VNC callbacks
 
     // Register components
     world.component<Position>();
@@ -794,7 +1086,10 @@ int main(int, char *[]) {
     world.component<GameWindow>();
     world.component<Graphics>().add(flecs::Singleton);
     world.component<RenderQueue>();
+    world.component<RenderTexture>();
     world.component<VNCClient>();
+    world.component<VNCTexture>();
+    world.component<VNCViewState>();
 
     // Create singleton entities for global resources
     auto windowEntity = world.entity("GameWindow")
@@ -909,120 +1204,76 @@ int main(int, char *[]) {
 
     // Create cursor entity with 8-frame animation
     auto cursorEntity = world.entity("Cursor")
-        .set<Position, Local>({0.0f, 0.0f})
+        .set<Position, Local>({1000.0f, 1400.0f})
         .set<Position, World>({0.0f, 0.0f})
         .set<CreateSprite>({"../assets/arrow.png", 1.0f, 1.0f, 1.0f, false, 1, 8})  // 1 row, 8 columns
         .set<ZIndex>({1000}); // High z-index to render on top
 
-    // Create SDL window/renderer from GLFW's X11 window
-    Window x11Window = glfwGetX11Window(window);
-    std::cout << "GLFW X11 window: " << x11Window << std::endl;
+    // Create VNC view state singleton
+    world.set<VNCViewState>({true, 0});
 
-    // Create SDL window from existing X11 window
-    SDL_Window* sdlWindow = SDL_CreateWindowFrom((void*)(uintptr_t)x11Window);
-    if (!sdlWindow) {
-        std::cerr << "Failed to create SDL window from X11: " << SDL_GetError() << std::endl;
-    } else {
-        std::cout << "Created SDL window from GLFW X11 window" << std::endl;
-    }
+    // Create multiple VNC client entities (4 quadrants)
+    const char* hosts[NUM_VNC_CLIENTS] = {"localhost:5901", "localhost:5902", "localhost:5903", "localhost:5904"};
+    flecs::entity vncEntities[NUM_VNC_CLIENTS];
 
-    // Create SDL renderer
-    SDL_Renderer* sdlRenderer = nullptr;
-    if (sdlWindow) {
-        sdlRenderer = SDL_CreateRenderer(sdlWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-        if (!sdlRenderer) {
-            std::cerr << "Failed to create SDL renderer: " << SDL_GetError() << std::endl;
+    for (int i = 0; i < NUM_VNC_CLIENTS; i++) {
+        std::cout << "[VNC] Creating VNC client entity for quadrant " << i << "..." << std::endl;
+        std::string entityName = "VNCClient" + std::to_string(i);
+        vncEntities[i] = world.entity(entityName.c_str());
+
+        // Parse host:port
+        std::string hostStr(hosts[i]);
+        size_t colonPos = hostStr.find(':');
+        std::string hostname = hostStr.substr(0, colonPos);
+        int port = std::stoi(hostStr.substr(colonPos + 1));
+
+        // Connect to VNC server
+        rfbClient* vncClient = connectToTurboVNC(hostname.c_str(), port);
+        if (vncClient) {
+            std::cout << "[VNC] VNC client " << i << " connected successfully" << std::endl;
+            SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vncClient, (void*)VNC_SURFACE_TAG);
+
+            vncEntities[i].set<VNCClient>({
+                vncClient,
+                surface,
+                true,
+                hostname,
+                port,
+                vncClient->width,
+                vncClient->height,
+                i  // quadrant
+            });
+
+            // Create OpenGL texture for VNC framebuffer
+            GLuint vncTexture;
+            glGenTextures(1, &vncTexture);
+            glBindTexture(GL_TEXTURE_2D, vncTexture);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, vncClient->width, vncClient->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+            std::cout << "[VNC] Created OpenGL texture: " << vncTexture << " for quadrant " << i << std::endl;
+
+            // Create NanoVG image from OpenGL texture
+            int nvgVNCHandle = nvglCreateImageFromHandleGL3(vg, vncTexture, vncClient->width, vncClient->height, 0);
+            std::cout << "[VNC] Created NanoVG handle: " << nvgVNCHandle << " for quadrant " << i << std::endl;
+
+            vncEntities[i].set<VNCTexture>({vncTexture, nvgVNCHandle, vncClient->width, vncClient->height, false});
+
+            // Position based on quadrant (will be updated by render system)
+            float posX = (i == 1 || i == 3) ? (float)(mode->width / 2) : 0.0f;
+            float posY = (i == 2 || i == 3) ? (float)(mode->height / 2) : 0.0f;
+
+            vncEntities[i].set<Position, Local>({posX, posY})
+                         .set<Position, World>({posX, posY})
+                         .set<ImageRenderable>({nvgVNCHandle, (float)vncClient->width, (float)vncClient->height, 1.0f})
+                         .set<ZIndex>({10});
+
+            std::cout << "[VNC] VNC display entity " << i << " created at (" << posX << ", " << posY << ")" << std::endl;
         } else {
-            std::cout << "Created SDL renderer" << std::endl;
-            SDL_SetRenderDrawBlendMode(sdlRenderer, SDL_BLENDMODE_BLEND);
+            std::cerr << "[VNC ERROR] Failed to connect to VNC server " << hosts[i] << std::endl;
         }
     }
-
-    // Create VNC client entity
-    auto vncEntity = world.entity("VNCClient");
-    VNCClient vncComp;
-    vncComp.sdlWindow = sdlWindow;
-    vncComp.sdlRenderer = sdlRenderer;
-
-    // Connect to x11vnc on localhost:5901
-    vncComp.client = connectToTurboVNC("localhost", 5901, &vncComp);
-
-    if (vncComp.client) {
-        std::cout << "VNC connected successfully to localhost:5901" << std::endl;
-
-        // Request initial framebuffer update
-        SendFramebufferUpdateRequest(vncComp.client, 0, 0, vncComp.client->width, vncComp.client->height, FALSE);
-
-        // Wait for and process the initial frame
-        std::cout << "Waiting for initial VNC frame..." << std::endl;
-        int timeout = 0;
-        bool gotUpdate = false;
-
-        // First wait creates the surface
-        while (!vncComp.surface && timeout < 5000) {
-            int result = WaitForMessage(vncComp.client, 100000); // 100ms timeout
-            if (result > 0) {
-                if (!HandleRFBServerMessage(vncComp.client)) {
-                    std::cerr << "Failed to get initial frame" << std::endl;
-                    break;
-                }
-            }
-            timeout += 100;
-        }
-
-        std::cout << "Surface created, now waiting for actual frame data..." << std::endl;
-
-        // Now wait for actual frame data to arrive
-        timeout = 0;
-        while (!gotUpdate && timeout < 5000) {
-            int result = WaitForMessage(vncComp.client, 100000); // 100ms timeout
-            if (result > 0) {
-                if (!HandleRFBServerMessage(vncComp.client)) {
-                    std::cerr << "Failed to get frame data" << std::endl;
-                    break;
-                }
-                if (vncComp.needsUpdate) {
-                    gotUpdate = true;
-                    std::cout << "Got actual frame data!" << std::endl;
-                }
-            }
-            timeout += 100;
-        }
-
-        if (!gotUpdate) {
-            std::cout << "Warning: Never received frame data update" << std::endl;
-        }
-
-        if (vncComp.surface && vncComp.surface->pixels && gotUpdate) {
-            std::cout << "Got VNC frame with data: " << vncComp.width << "x" << vncComp.height << std::endl;
-
-            // Save SDL surface as BMP for debugging
-            const char* bmpPath = "../assets/vnc_sdl_capture.bmp";
-            if (SDL_SaveBMP(vncComp.surface, bmpPath) == 0) {
-                std::cout << "Saved SDL surface to " << bmpPath << std::endl;
-            }
-
-            // Update SDL texture with surface data
-            if (vncComp.sdlTexture) {
-                SDL_Rect rect = {0, 0, vncComp.surface->w, vncComp.surface->h};
-                if (SDL_UpdateTexture(vncComp.sdlTexture, &rect, vncComp.surface->pixels, vncComp.surface->pitch) < 0) {
-                    std::cerr << "Failed to update SDL texture: " << SDL_GetError() << std::endl;
-                } else {
-                    std::cout << "Updated SDL texture with VNC frame data" << std::endl;
-                }
-            }
-        } else {
-            std::cerr << "Failed to get initial VNC frame with data" << std::endl;
-        }
-
-        // Disconnect - we don't need the connection anymore
-        rfbClientCleanup(vncComp.client);
-        vncComp.client = nullptr;
-    } else {
-        std::cerr << "Failed to connect to VNC server on localhost:5901" << std::endl;
-    }
-
-    vncEntity.set<VNCClient>(vncComp);
 
     // Hierarchical positioning system - computes world positions from local positions
     auto hierarchicalQuery = world.query_builder<const Position, const Position*, Position>()
@@ -1111,14 +1362,6 @@ int main(int, char *[]) {
         .each([&](flecs::entity e, Position& worldPos, ImageRenderable& renderable, ZIndex& zIndex) {
             RenderQueue& queue = world.ensure<RenderQueue>();
             queue.addImageCommand(worldPos, renderable, zIndex.layer);
-
-            static int debugCount = 0;
-            if (debugCount++ % 60 == 0) {
-                const char* name = e.name() ? e.name() : "unnamed";
-                std::cout << "Queue image: " << name << " at (" << worldPos.x << "," << worldPos.y
-                          << ") size: " << renderable.width << "x" << renderable.height
-                          << " handle: " << renderable.imageHandle << " z: " << zIndex.layer << std::endl;
-            }
         });
 
     // Sprite animation system
@@ -1163,6 +1406,215 @@ int main(int, char *[]) {
                 sprite.h
             };
             queue.addImageCommand(worldPos, frameRenderable, zIndex.layer);
+        });
+
+    // VNC view update system - updates VNC client positions and sizes based on view mode
+    auto vncViewUpdateSystem = world.system<VNCClient, ImageRenderable>()
+        .kind(flecs::PreUpdate)
+        .each([&](flecs::entity e, VNCClient& vnc, ImageRenderable& img) {
+            if (!vnc.connected || !vnc.client) return;
+
+            const VNCViewState* viewState = world.try_get<VNCViewState>();
+            if (!viewState) return;
+
+            auto windowComp = world.try_get<GameWindow>();
+            if (!windowComp) return;
+
+            int win_w = windowComp->width;
+            int win_h = windowComp->height;
+
+            if (viewState->quadrantView) {
+                // Quadrant view mode - show all 4 VNC streams in a 2x2 grid
+                int quadrant_w = win_w / 2;
+                int quadrant_h = win_h / 2;
+
+                // Calculate scaled dimensions to fit within quadrant while maintaining aspect ratio
+                float scale_w = (float)quadrant_w / vnc.width;
+                float scale_h = (float)quadrant_h / vnc.height;
+                float scale = (scale_w < scale_h) ? scale_w : scale_h;
+
+                int scaled_w = (int)(vnc.width * scale);
+                int scaled_h = (int)(vnc.height * scale);
+
+                // Position based on quadrant
+                int quad_offset_x = (vnc.quadrant == 1 || vnc.quadrant == 3) ? quadrant_w : 0;
+                int quad_offset_y = (vnc.quadrant == 2 || vnc.quadrant == 3) ? quadrant_h : 0;
+
+                // Center within quadrant
+                float posX = quad_offset_x + (quadrant_w - scaled_w) / 2.0f;
+                float posY = quad_offset_y + (quadrant_h - scaled_h) / 2.0f;
+
+                e.set<Position, Local>({posX, posY});
+                img.width = (float)scaled_w;
+                img.height = (float)scaled_h;
+                img.alpha = 1.0f;  // Fully visible
+            } else {
+                // Interactive mode - show only the active quadrant fullscreen
+                if (vnc.quadrant == viewState->activeQuadrant) {
+                    // Calculate scaled dimensions to fit window while maintaining aspect ratio
+                    float scale_w = (float)win_w / vnc.width;
+                    float scale_h = (float)win_h / vnc.height;
+                    float scale = (scale_w < scale_h) ? scale_w : scale_h;
+
+                    int scaled_w = (int)(vnc.width * scale);
+                    int scaled_h = (int)(vnc.height * scale);
+
+                    // Center in window
+                    float posX = (win_w - scaled_w) / 2.0f;
+                    float posY = (win_h - scaled_h) / 2.0f;
+
+                    e.set<Position, Local>({posX, posY});
+                    img.width = (float)scaled_w;
+                    img.height = (float)scaled_h;
+                    img.alpha = 1.0f;  // Fully visible
+                } else {
+                    // Hide other quadrants
+                    img.alpha = 0.0f;
+                }
+            }
+        });
+
+    // VNC initialization system - requests initial framebuffer update
+    auto vncInitSystem = world.system<VNCClient>()
+        .kind(flecs::PreUpdate)
+        .each([](flecs::iter& it, size_t i, VNCClient& vnc) {
+            static bool initialized[NUM_VNC_CLIENTS] = {false};
+            if (!initialized[vnc.quadrant] && vnc.connected && vnc.client) {
+                std::cout << "[VNC INIT] Requesting full framebuffer update for quadrant " << vnc.quadrant << "..." << std::endl;
+                SendFramebufferUpdateRequest(vnc.client, 0, 0, vnc.client->width, vnc.client->height, FALSE);
+                initialized[vnc.quadrant] = true;
+                std::cout << "[VNC INIT] Initial update request sent for quadrant " << vnc.quadrant << " " << vnc.client->width << "x" << vnc.client->height << std::endl;
+            }
+        });
+
+    // VNC polling system - checks for VNC messages
+    auto vncPollingSystem = world.system<VNCClient>()
+        .kind(flecs::PreUpdate)
+        .each([](flecs::entity e, VNCClient& vnc) {
+            if (!vnc.connected || !vnc.client) {
+                static bool warned = false;
+                if (!warned) {
+                    std::cout << "[VNC POLL] Client not connected" << std::endl;
+                    warned = true;
+                }
+                return;
+            }
+
+            // Poll for VNC messages with 1ms timeout
+            int result = WaitForMessage(vnc.client, 1);
+            if (result < 0) {
+                std::cerr << "[VNC ERROR] Connection lost (result=" << result << ")" << std::endl;
+                vnc.connected = false;
+            } else if (result > 0) {
+                std::cout << "[VNC POLL] Message available, handling..." << std::endl;
+                if (!HandleRFBServerMessage(vnc.client)) {
+                    std::cerr << "[VNC ERROR] Failed to handle server message" << std::endl;
+                    vnc.connected = false;
+                } else {
+                    std::cout << "[VNC POLL] Message handled successfully" << std::endl;
+                }
+            }
+            // result == 0 means timeout (no message), which is normal
+        });
+
+    // VNC texture update system - updates OpenGL texture from SDL surface
+    auto vncTextureUpdateSystem = world.system<VNCClient, VNCTexture>()
+        .kind(flecs::OnUpdate)
+        .each([](flecs::entity e, VNCClient& vnc, VNCTexture& tex) {
+            if (!vnc.connected || !vnc.client) {
+                static bool warned = false;
+                if (!warned) {
+                    std::cout << "[VNC TEX] Client not connected or null" << std::endl;
+                    warned = true;
+                }
+                return;
+            }
+
+            if (!tex.needsUpdate) return;
+
+            std::cout << "[VNC TEX] Updating OpenGL texture " << tex.texture
+                      << " from framebuffer..." << std::endl;
+
+            SDL_Surface* surface = (SDL_Surface*)rfbClientGetClientData(vnc.client, (void*)VNC_SURFACE_TAG);
+            if (surface && surface->pixels) {
+                std::cout << "[VNC TEX] Processing " << tex.dirtyRects.size() << " dirty rectangles" << std::endl;
+                std::cout << "[VNC TEX] Surface info: " << surface->w << "x" << surface->h
+                          << ", format: " << SDL_GetPixelFormatName(surface->format->format)
+                          << ", pitch: " << surface->pitch
+                          << ", bpp: " << (int)surface->format->BitsPerPixel << std::endl;
+
+                // Update OpenGL texture from SDL surface pixels
+                glBindTexture(GL_TEXTURE_2D, tex.texture);
+
+                // Set pixel unpack alignment to handle pitch correctly
+                int bytesPerPixel = surface->format->BytesPerPixel;
+                int expectedPitch = surface->w * bytesPerPixel;
+
+                // CRITICAL: When updating partial rects, GL_UNPACK_ROW_LENGTH tells OpenGL
+                // how many pixels are in a row of the SOURCE data (the surface)
+                // This must be set to surface->pitch / bytesPerPixel regardless of whether
+                // we're updating the full surface or a partial rect
+                int rowLengthPixels = surface->pitch / bytesPerPixel;
+
+                std::cout << "[VNC TEX] Surface pitch: " << surface->pitch
+                          << " bytes, row length: " << rowLengthPixels << " pixels"
+                          << " (surface width: " << surface->w << " pixels)" << std::endl;
+
+                // Always set row length for partial updates
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, rowLengthPixels);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+                // Determine the correct pixel format based on SDL surface format
+                GLenum format = GL_BGRA;
+                if (surface->format->Rmask == 0xFF) {
+                    format = GL_RGBA;
+                }
+
+                std::cout << "[VNC TEX] Using OpenGL format: "
+                          << (format == GL_BGRA ? "BGRA" : "RGBA") << std::endl;
+
+                // Process each dirty rectangle
+                for (const auto& rectIn : tex.dirtyRects) {
+                    // Clamp rect to surface/texture bounds to be safe
+                    int rx = std::max(0, rectIn.x);
+                    int ry = std::max(0, rectIn.y);
+                    int rw = std::min(rectIn.w, surface->w - rx);
+                    int rh = std::min(rectIn.h, surface->h - ry);
+                    if (rw <= 0 || rh <= 0) continue;
+
+                    // Pointer to top-left of the dirty region
+                    uint8_t* regionStart = // NOTE: Changed to non-const for modification
+                        static_cast<uint8_t*>(surface->pixels) + ry * surface->pitch + rx * 4;
+
+                    // --- CRITICAL ADDITION: Force full alpha for the dirty rectangle ---
+                    // This assumes a 32-bit format (bpp=4) where the alpha channel is the
+                    // last byte of the 4-byte pixel (e.g., RGBA or BGRA).
+                    // If the format is different, the offset (bpp - 1) needs adjustment.
+                    for (int y = 0; y < rh; ++y) {
+                        uint8_t* rowStart = regionStart + y * surface->pitch;
+                        for (int x = 0; x < rw; ++x) {
+                            // Set the alpha component (last byte) to 0xFF (fully opaque)
+                            rowStart[x * 4 + (4 - 1)] = 0xFF;
+                        }
+                    }
+                    // ------------------------------------------------------------------
+
+                    // Critical change: we keep GL_UNPACK_ROW_LENGTH set so GL steps by `pitch` each row.
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, rx, ry, rw, rh, format, GL_UNSIGNED_BYTE, regionStart);
+                }
+
+                // Reset to defaults
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+
+                std::cout << "[VNC TEX] All rects updated successfully" << std::endl;
+
+                // Clear dirty rects and mark as updated
+                tex.dirtyRects.clear();
+                tex.needsUpdate = false;
+            } else {
+                std::cerr << "[VNC TEX ERROR] Surface or pixels is null" << std::endl;
+            }
         });
 
     // world.system<LibEvDevice, KeyboardState, CursorState>("PollEvents")
@@ -1210,13 +1662,6 @@ int main(int, char *[]) {
                     case RenderType::Image: {
                         const auto& image = std::get<ImageRenderable>(cmd.renderData);
                         if (image.imageHandle != -1) {
-                            static int imgDebugCount = 0;
-                            if (imgDebugCount++ % 60 == 0) {
-                                std::cout << "Actually rendering image at (" << cmd.pos.x << "," << cmd.pos.y
-                                         << ") size: " << image.width << "x" << image.height
-                                         << " handle: " << image.imageHandle << std::endl;
-                            }
-
                             // Set global alpha for proper transparency blending
                             nvgGlobalAlpha(graphics.vg, image.alpha);
 
@@ -1468,6 +1913,38 @@ int main(int, char *[]) {
 
     int fontHandle = nvgCreateFont(vg, "CharisSIL-Regular", "../assets/CharisSIL-Regular.ttf");
 
+    // Create a render texture (framebuffer)
+    GLuint fbo, renderTex;
+    glGenFramebuffers(1, &fbo);
+    glGenTextures(1, &renderTex);
+
+    int texWidth = 512;
+    int texHeight = 512;
+
+    glBindTexture(GL_TEXTURE_2D, renderTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, texWidth, texHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, renderTex, 0);
+
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        std::cerr << "Framebuffer not complete!" << std::endl;
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    // Create NanoVG image from the texture
+    int nvgTexHandle = nvglCreateImageFromHandleGL3(vg, renderTex, texWidth, texHeight, 0);
+
+    auto renderTextureEntity = world.entity("RenderTexture")
+        .set<RenderTexture>({fbo, renderTex, texWidth, texHeight})
+        .set<Position, Local>({100.0f, 100.0f})
+        .set<Position, World>({100.0f, 100.0f})
+        .set<ImageRenderable>({nvgTexHandle, (float)texWidth, (float)texHeight, 1.0f})
+        .set<ZIndex>({5});
+
     // System to automatically update clickable bounds from ImageRenderable components
     auto clickableBoundsSystem = world.system<Clickable, ImageRenderable>()
         .each([&](flecs::entity e, Clickable& clickable, ImageRenderable& image) {
@@ -1513,30 +1990,41 @@ int main(int, char *[]) {
             }
         });
 
-    // VNC update system removed - we now capture one frame at startup
-
     // Main loop
     while (!glfwWindowShouldClose(window)) {
-        processInput(window);
-
+        processInput(window, world);
+        
         int winWidth, winHeight;
         glfwGetFramebufferSize(window, &winWidth, &winHeight);
         float pxRatio = (float)winWidth / (float)800;
 
+        // Render to texture first
+        glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+        glViewport(0, 0, texWidth, texHeight);
+        glClearColor(0.2f, 0.3f, 0.4f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
+
+        nvgBeginFrame(vg, texWidth, texHeight, 1.0f);
+
+        // Draw a rectangle on the texture
+        nvgBeginPath(vg);
+        nvgRect(vg, 50, 50, 200, 150);
+        nvgFillColor(vg, nvgRGBA(255, 100, 50, 255));
+        nvgFill(vg);
+
+        nvgEndFrame(vg);
+
+        // Unbind framebuffer
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+        // Render to main window
         glViewport(0, 0, winWidth, winHeight);
-        glClearColor(0.1f, 0.2f, 0.2f, 0.0f);
+        // glClearColor(0.1f, 0.2f, 0.2f, 0.0f);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
 
         // Update window size in ECS
         windowEntity.set<GameWindow>({window, winWidth, winHeight});
-
-        // Render SDL texture first (VNC desktop background)
-        const VNCClient* vncData = vncEntity.try_get<VNCClient>();
-        if (vncData && vncData->sdlRenderer && vncData->sdlTexture) {
-            SDL_RenderClear(vncData->sdlRenderer);
-            SDL_RenderCopy(vncData->sdlRenderer, vncData->sdlTexture, NULL, NULL);
-            SDL_RenderPresent(vncData->sdlRenderer);
-        }
 
         nvgBeginFrame(vg, winWidth, winHeight, pxRatio);
 
